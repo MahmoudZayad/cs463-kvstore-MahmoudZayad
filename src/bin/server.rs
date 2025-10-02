@@ -2,7 +2,7 @@
 // TCP server that loads TreeMap from disk, persists after mutations.
 use clap::{ArgAction, Parser};
 use std::net::{TcpListener, TcpStream};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write, Seek};
 use std::sync::{Arc, RwLock};
 use kvstore::TreeMap;
 use std::fs::*;
@@ -27,26 +27,29 @@ struct Args {
     dbfile: String,
 
     /// Location of the database transaction log
-    #[arg(short, long, default_value = "kvstore.log")]
+    #[arg(short, long, default_value = "/tmp/kvstore_mzayad2.log")]
     logfile: String,
 
-
+    /// Snapshot interval
+    #[arg(short, long, default_value = "1000")]
+    snapshot_interval: u64,
 
     /// Pass this code to the server EXIT command to have it exit
     #[arg(short, long, default_value = "")]
     exit_code: String,    
 }
 
-fn handle_client(args: Arc<Args>, stream: TcpStream, map: Arc<RwLock<TreeMap<String, String>>>) {
+fn handle_client(args: Arc<Args>, stream: TcpStream, map: Arc<RwLock<TreeMap<String, String>>>, log: Arc<RwLock<File>>, batch_counter: Arc<RwLock<u64>>) {
     let mut writer = stream.try_clone().unwrap();
     let reader = BufReader::new(&stream);
     let mut lines = reader.lines();
     let mut response = String::new();
+    let mut log_entries = Vec::new();
     while let Some(Ok(line)) = lines.next() {
         let parts: Vec<&str> = line.trim_end().splitn(3, ' ').collect();
         match parts[0] {
             "GET" if parts.len() == 2 => {
-                let map = map.read().unwrap();                
+                let map = map.read().unwrap();               
                 response.push_str(&match map.get(&parts[1].to_string()) {
                     Some(v) => format!("OK {}\r\n", v),
                     None    => "ERR NotFound\r\n".into(),
@@ -54,23 +57,15 @@ fn handle_client(args: Arc<Args>, stream: TcpStream, map: Arc<RwLock<TreeMap<Str
             }
             "SET" if parts.len() == 3 => {
                 let mut map = map.write().unwrap();
+                log_entries.push(line.clone());
                 map.insert(parts[1].to_string(), parts[2].to_string());
-                if !args.memonly {
-                    if let Err(e) = map.save_to_file(&args.dbfile) {
-                        eprintln!("Failed to save DB: {}", e);
-                    }
-                }
                 response.push_str("OK\r\n");
             }
             "REMOVE" if parts.len() == 2 => {
                 let mut map = map.write().unwrap();
                 response.push_str(match map.remove(&parts[1].to_string()) {
                     Some(_) => {
-                        if !args.memonly {
-                            if let Err(e) = map.save_to_file(&args.dbfile) {
-                                eprintln!("Failed to save DB: {}", e);
-                            }
-                        }
+                        log_entries.push(line.clone());
                         "OK\r\n"
                     }
                     None => "ERR NotFound\r\n",
@@ -84,9 +79,41 @@ fn handle_client(args: Arc<Args>, stream: TcpStream, map: Arc<RwLock<TreeMap<Str
                 });
             }
             "ENDBATCH" => {
-                writer.write_all(response.as_bytes()).unwrap();
-                response=String::new();
-            }            
+                // Send responses first
+                if response.len() > 0 {
+                    writer.write_all(response.as_bytes()).unwrap();
+                }
+                response = String::new();
+
+                // Handle logging and snapshots
+                if log_entries.len() > 0 && !args.memonly {
+                    // Write to log
+                    let mut log_file = log.write().unwrap();
+                    let batch_data = log_entries.join("\n") + "\n";
+                    log_file.write_all(batch_data.as_bytes()).unwrap();
+                    log_file.flush().unwrap();
+
+                    // Check for snapshot
+                    let mut counter = batch_counter.write().unwrap();
+                    *counter += 1;
+                    if *counter >= args.snapshot_interval {
+                        *counter = 0;
+                        drop(log_file); // Release lock before snapshot
+                        
+                        // Create snapshot
+                        let map_read = map.read().unwrap();
+                        map_read.save_to_file(&args.dbfile).unwrap();
+                        drop(map_read);
+                        
+                        // Truncate log
+                        let mut log_file = log.write().unwrap();
+                        Seek::rewind(&mut *log_file).unwrap();
+                        log_file.set_len(0).unwrap();
+                    }
+                    
+                    log_entries.clear();
+                }
+            }
             "EXIT" if parts.len() == 2 && parts[1] == args.exit_code  => {
                 eprintln!("Received EXIT command with correct exit code. Exiting.");
                 std::process::exit(0);
@@ -118,7 +145,6 @@ fn recover_from_log(map: &mut TreeMap<String,String>, log: File) {
         }  
     }
     println!("Recovered {count} updates from log.\n");
-
 }
 fn main() -> std::io::Result<()> {
     let args = Arc::new(Args::parse());
@@ -138,6 +164,15 @@ fn main() -> std::io::Result<()> {
     }    
 
     let map = Arc::new(RwLock::new(map));
+    let batch_counter = Arc::new(RwLock::new(0u64));
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .append(true)
+        .open(&args.logfile)?;
+    let log = Arc::new(RwLock::new(log_file));
 
     let listener = TcpListener::bind(&args.addr)?;
     println!("Server listening on {}",args.addr);
@@ -151,13 +186,15 @@ fn main() -> std::io::Result<()> {
                 s.set_nodelay(true)?;                 
                 let args = args.clone();
                 let map = map.clone();
+                let log = log.clone();
+                let batch_counter = batch_counter.clone();
 
                 // use the new --singlethread command line argument to set this
                 if args.singlethread {
-                    handle_client(args, s, map);
+                    handle_client(args, s, map, log, batch_counter);
                 }
                 else { 
-                    std::thread::spawn(move || { handle_client(args, s, map); });
+                    std::thread::spawn(move || { handle_client(args, s, map, log, batch_counter); });
                 }
             }
             Err(e) => eprintln!("Connection failed: {}", e),
